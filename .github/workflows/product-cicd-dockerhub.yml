@@ -1,0 +1,184 @@
+name: Product API CI-CD Docker Hub and Local
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: product-api-dockerhub-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI - Healthcheck and CRUD
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COMPOSE_FILE: compose.ci.yaml
+      COMPOSE_PROJECT_NAME: product-api-cicd
+      API_BASE_URL: http://127.0.0.1:13000
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js for HTTP tests
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Create CI environment
+        run: |
+          cat > .env.ci <<'EOF'
+          NODE_ENV=production
+          HOST=0.0.0.0
+          PORT=3000
+          MONGO_URI=mongodb://mongodb:27017/product_api_ci
+          HEALTHCHECK_TIMEOUT_MS=2000
+          EOF
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build image and wait for MongoDB and API healthchecks
+        run: docker compose up --build --wait --wait-timeout 180
+
+      - name: Test CRUD and MongoDB persistence
+        run: node --test --test-reporter=tap test/product-api.prod.test.js
+
+      - name: Confirm both containers are still healthy
+        run: |
+          for service in mongodb api; do
+            container_id="$(docker compose ps -q "$service")"
+            test -n "$container_id"
+            health="$(docker inspect --format '{{.State.Health.Status}}' "$container_id")"
+            echo "$service health: $health"
+            test "$health" = healthy
+          done
+
+      - name: Export the exact image tested by CI
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        run: |
+          container_id="$(docker compose ps -q api)"
+          image_id="$(docker inspect --format '{{.Image}}' "$container_id")"
+          docker tag "$image_id" "product-api-ci:$GITHUB_SHA"
+          docker save --output "$RUNNER_TEMP/product-api-image.tar" "product-api-ci:$GITHUB_SHA"
+          printf '%s\n' "$image_id" > "$RUNNER_TEMP/image-id.txt"
+
+      - name: Transfer tested image to CD
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/upload-artifact@v7
+        with:
+          name: tested-product-api
+          path: |
+            ${{ runner.temp }}/product-api-image.tar
+            ${{ runner.temp }}/image-id.txt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Show diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail 200
+
+      - name: Remove CI containers and test volume
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  cd:
+    name: CD - Publish tested image to Docker Hub
+    needs: ci
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      image: ${{ vars.DOCKERHUB_IMAGE }}
+      tag: sha-${{ github.sha }}
+    env:
+      DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+      DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+
+    steps:
+      - name: Validate Docker Hub settings
+        run: |
+          test -n "$DOCKERHUB_USERNAME" || { echo 'Missing repository variable DOCKERHUB_USERNAME'; exit 1; }
+          [[ "$DOCKERHUB_IMAGE" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9._-]*$ ]] || {
+            echo 'Set repository variable DOCKERHUB_IMAGE to namespace/product-api'; exit 1;
+          }
+
+      - name: Download tested image from this workflow run
+        uses: actions/download-artifact@v8
+        with:
+          name: tested-product-api
+          path: ${{ runner.temp }}/tested-image
+
+      - name: Load image and verify it matches CI
+        run: |
+          docker load --input "$RUNNER_TEMP/tested-image/product-api-image.tar"
+          expected_id="$(cat "$RUNNER_TEMP/tested-image/image-id.txt")"
+          actual_id="$(docker image inspect --format '{{.Id}}' "product-api-ci:$GITHUB_SHA")"
+          test "$actual_id" = "$expected_id"
+          docker image inspect --format '{{json .Config.Healthcheck}}' "product-api-ci:$GITHUB_SHA"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push versioned image and latest
+        run: |
+          docker tag "product-api-ci:$GITHUB_SHA" "$DOCKERHUB_IMAGE:sha-$GITHUB_SHA"
+          docker tag "product-api-ci:$GITHUB_SHA" "$DOCKERHUB_IMAGE:latest"
+          docker push "$DOCKERHUB_IMAGE:sha-$GITHUB_SHA"
+          docker push "$DOCKERHUB_IMAGE:latest"
+          printf 'Published %s and %s after healthy CI and CRUD tests.\n' \
+            "$DOCKERHUB_IMAGE:sha-$GITHUB_SHA" "$DOCKERHUB_IMAGE:latest" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-local:
+    name: Deploy to Local Docker Engine
+    needs: [ci, cd]
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, Windows, X64, product-api-local]
+    timeout-minutes: 15
+    concurrency:
+      group: product-api-local-deployment
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: powershell
+    env:
+      LOCAL_DEPLOY_PATH: ${{ vars.LOCAL_DEPLOY_PATH || 'D:\Project\product-api' }}
+      RELEASE_IMAGE: ${{ needs.cd.outputs.image }}
+      RELEASE_TAG: ${{ needs.cd.outputs.tag }}
+
+    steps:
+      - name: Checkout deployment code in runner workspace
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check local Docker and deployment configuration
+        run: |
+          & "$env:GITHUB_WORKSPACE\scripts\deploy-local.ps1" `
+            -DeploymentPath $env:LOCAL_DEPLOY_PATH `
+            -DockerHubImage $env:RELEASE_IMAGE -ImageTag $env:RELEASE_TAG -CheckOnly
+
+      - name: Log in to Docker Hub for image pull
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Deploy published commit and wait for local healthchecks
+        run: |
+          & "$env:GITHUB_WORKSPACE\scripts\deploy-local.ps1" `
+            -DeploymentPath $env:LOCAL_DEPLOY_PATH `
+            -DockerHubImage $env:RELEASE_IMAGE -ImageTag $env:RELEASE_TAG

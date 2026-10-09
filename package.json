@@ -1,0 +1,20 @@
+{
+  "name": "product-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "REST API CRUD Product voi Express, Mongoose va MongoDB Docker",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test test/product-api.test.js"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "mongoose": "^9.0.0"
+  }
+}

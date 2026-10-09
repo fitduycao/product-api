@@ -1,0 +1,42 @@
+name: product-api
+
+services:
+  mongodb:
+    image: mongo:8.0
+    container_name: nammongodb
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "quit(db.runCommand({ ping: 1 }).ok === 1 ? 0 : 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  api:
+    image: "${DOCKERHUB_IMAGE:?Set DOCKERHUB_IMAGE in .env.prod}:${IMAGE_TAG:-latest}"
+    platform: linux/amd64
+    pull_policy: always
+    container_name: product-api
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-3000}:${PORT:-3000}"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "src/healthcheck.js"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+volumes:
+  mongodb_data:
+    external: true
+    name: nammongodb_data

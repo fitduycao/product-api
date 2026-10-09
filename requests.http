@@ -1,0 +1,43 @@
+@baseUrl = http://127.0.0.1:3000
+
+### Kiem tra ket noi MongoDB
+GET {{baseUrl}}/health
+
+### Create - tao san pham
+POST {{baseUrl}}/api/products
+Content-Type: application/json
+
+{
+  "pid": "P001",
+  "pname": "Ban phim",
+  "price": 350000,
+  "quantity": 10
+}
+
+### Read - danh sach san pham
+GET {{baseUrl}}/api/products
+
+### Read - tim theo pid
+GET {{baseUrl}}/api/products/P001
+
+### Update - gui du bon truong
+PUT {{baseUrl}}/api/products/P001
+Content-Type: application/json
+
+{
+  "pid": "P001",
+  "pname": "Ban phim co",
+  "price": 500000,
+  "quantity": 8
+}
+
+### Update - chi sua quantity
+PATCH {{baseUrl}}/api/products/P001
+Content-Type: application/json
+
+{
+  "quantity": 5
+}
+
+### Delete - xoa san pham
+DELETE {{baseUrl}}/api/products/P001
